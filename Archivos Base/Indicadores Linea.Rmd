@@ -1,0 +1,452 @@
+---
+title: "Analisis Linea"
+author: "Tomas Daels"
+date: "22 de Febrero de 2019"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(sf)
+library(ggmap)
+library(viridis)
+library(lubridate)
+library(hexbin)
+library(tmap)
+library(mapdeck)
+options(scipen = 10)
+library(usethis)
+use_git_config(user.name = "tdaels", user.email = "tdaels@gmail.com")
+
+
+```
+## Carga de datos
+Para el cálculo de los parámetros operativos procedemos a realizar la carga de los datos
+En este caso cargamos todos los reportes de posicionamiento de GPS a lo largo de una semana de la línea.
+
+```{r, }
+linea<- 165
+GPS<-read_sf("Puntos SUBE/Junio/LINEA 165_128_gps.geojson")
+TRX<-read_sf("Puntos SUBE/Junio/165_TRX.geojson")
+TRX[is.na(TRX)] <- 0
+TRX<-mutate(TRX, g_date=ymd_hms(g_date),lon = st_coordinates(TRX)[,1],
+           lat = st_coordinates(TRX)[,2]) %>% 
+  filter(lat<0)
+
+lineas<-read_sf("Lineas Expreso Lomas.geojson")
+```
+
+
+## Parque móvil Actual
+
+Se determinará por separado el parque utilizado en toda la semana, en cada día y por hora. para esto se relevará en cada una de las medidas de tiempo antes mencionadas la cantidad de unidades activas.
+
+Realizamos el conteo total de unidades que estuvieron activas en la semana, en el día y por hora.
+
+```{r echo=FALSE}
+P_tot_sem<-count(summarise(group_by(GPS,s_vehicl)))
+P_tot_dia<-count(summarise(group_by(GPS, g_dayOfM,s_vehicl)))
+P_tot_hora<-count(summarise(group_by(GPS, g_dayOfM, g_hour,s_vehicl)))
+
+max(P_tot_sem$n)
+max(P_tot_dia$n)
+max(P_tot_hora$n)
+```
+
+```{r echo=FALSE}
+ggplot(P_tot_hora)+
+  geom_bar( aes(x=g_dayOfM, group=(g_hour), weight=n), fill="lightblue" , color= "black", position="dodge") +
+    scale_fill_viridis_d(option = "D") +    
+         labs(title = paste0("Linea",linea) ,
+         subtitle = "Parque utilizado por hora",
+         caption = "Fuente: Datos SUBE JUNIO 2018",
+          x="Dia",y="Cantidad de vehiculos")
+```
+
+## Tiempos de Vuelta
+
+Se seleccionan puntos de interes para determinar los tiempos de vuelta de cada uno de los recorridos.
+
+```{r}
+
+
+buffer_pdi<-read_sf("Shapes/Buffers.shp")
+
+GPS_buffer<- st_join(GPS, buffer_pdi) %>% filter(!is.na(id))
+
+Lomas<-as.data.frame(filter(GPS_buffer, id == 1))
+Pompeya<-as.data.frame(filter(GPS_buffer, id == 2))
+Once<-as.data.frame(filter(GPS_buffer, id == 3))
+Monte_Grande<-as.data.frame(filter(GPS_buffer, id == 04))
+Burzaco<-as.data.frame(filter(GPS_buffer, id == 10)) 
+
+
+```
+Funciones para determinar primer y última señal GPS en los Buffers
+```{r}
+primeros<-function(A){
+    mutate (A,g_date=ymd_hms(g_date)) %>%
+    select(g_date, s_vehicl, Nombre, id, s_id) %>% 
+    arrange( s_vehicl, g_date) %>% 
+    group_by(s_vehicl) %>% 
+    mutate(agrupado=(g_date-lag(g_date))/dminutes(1)) %>% 
+    mutate(agrupado = if_else(is.na(agrupado),1,if_else(agrupado>20,1,0))) %>% 
+    filter(agrupado==1)
+  
+}
+ultimos<-function(A){
+    mutate (A,g_date=ymd_hms(g_date)) %>%
+    select(g_date, s_vehicl, Nombre, id, s_id) %>% 
+    arrange( s_vehicl, g_date) %>% 
+    group_by(s_vehicl) %>% 
+    mutate(agrupado=(lead(g_date)-g_date)/dminutes(1)) %>% 
+    mutate(agrupado = if_else(is.na(agrupado),1,if_else(agrupado>20,1,0))) %>% 
+    filter(agrupado==1)
+  
+}
+
+proceso_tvuelta<-function(A,B, t_limite = 150, ramal = "Ramal A", sentido = "Ida"){
+left_join(A, B, by = "s_vehicl") %>% 
+  mutate(g_date.x=ymd_hms(g_date.x), g_date.y=ymd_hms(g_date.y)) %>% 
+  mutate (t_vuelta = (g_date.y-g_date.x)/dminutes(1)) %>% 
+  filter(t_vuelta>0,t_vuelta<t_limite)%>% 
+  mutate(g_hour=hour(g_date.x), Ramal = ramal, Sentido = sentido)  
+}
+
+proceso_tvuelta_2<-function(A,B, t_limite = 150, ramal = "Ramal A", sentido = "Ida"){
+left_join(A, B, by = "s_id") %>% 
+  mutate(g_date.x=ymd_hms(g_date.x), g_date.y=ymd_hms(g_date.y)) %>% 
+  mutate (t_vuelta = (g_date.y-g_date.x)/dminutes(1)) %>% 
+  filter(t_vuelta>0,t_vuelta<t_limite)%>% 
+  mutate(g_hour=hour(g_date.x), Ramal = ramal, Sentido = sentido)  
+}
+
+
+
+proceso_tviaje<- function(A,B) {
+A_ida<-summarise(group_by(A, g_hour, Ramal, Sentido), t_vuelta=mean(t_vuelta), n=n())
+A_vuelta<-summarise(group_by(B, g_hour, Ramal, Sentido), t_vuelta=mean(t_vuelta), n=n())  
+
+rbind(A_ida,A_vuelta)
+}
+
+
+
+```
+### Ramal A
+El ramal A es Lomas- Once:
+_se calcula el tiempo de vuelta en funcion de datos SUBE_
+
+```{r}
+id_ramal<-642
+Lomas_1<-filter(Lomas, s_branch==id_ramal) %>% 
+  primeros()
+Lomas_2<-filter(Lomas, s_branch==id_ramal) %>% 
+  ultimos()
+
+Once_1<-filter(Once, s_branch==id_ramal) %>% 
+  primeros()
+Once_2<-filter(Once, s_branch==id_ramal) %>% 
+  ultimos()
+
+
+
+Ramal_A_Ida_1<-proceso_tvuelta(Once_2,Lomas_1, 175, "Ramal A", "Ida" )
+Ramal_A_Vuelta_1<-proceso_tvuelta(Lomas_2, Once_1, 175, "Ramal A", "Vuelta" )
+
+
+
+t_viaje_A<-proceso_tviaje(Ramal_A_Ida_1,Ramal_A_Vuelta_1)
+
+t_max_A<-max(summarise(group_by(t_viaje_A, g_hour), t_tot= sum(t_vuelta)))
+hora_max_A<-filter(summarise(group_by(t_viaje_A, g_hour), t_tot= sum(t_vuelta)), t_tot==t_max_A) %>% 
+  select(g_hour)
+
+
+
+```
+
+```{r}
+ggplot(t_viaje_A)+
+  geom_bar(aes(x=g_hour, weight = t_vuelta, fill= Sentido), width=.75, color="Black") + 
+        labs(title = paste0("Linea",linea) ,
+        subtitle = "Tiempo de Vuelta Ramal A",
+        caption = "Fuente: Datos SUBE",
+        x="Hora inicio",y="Tiempo de vuelta (minutos)")
+
+```
+### Ramal B
+```{r, RAMAL B}
+
+ramal<-"Ramal B"
+id_ramal<-643
+Lomas_1<-filter(Lomas, s_branch==id_ramal) %>% 
+  primeros()
+Lomas_2<-filter(Lomas, s_branch==id_ramal) %>% 
+  ultimos()
+
+Once_1<-filter(Once, s_branch==id_ramal) %>% 
+  primeros()
+Once_2<-filter(Once, s_branch==id_ramal) %>% 
+  ultimos()
+
+
+Ramal_B_Ida_1<-proceso_tvuelta(Lomas_2, Once_1, 200, ramal, "Ida" )
+Ramal_B_Vuelta_1<-proceso_tvuelta(Once_2, Lomas_1, 200, ramal, "Vuelta" )
+
+t_viaje_B<-proceso_tviaje(Ramal_B_Ida_1,Ramal_B_Vuelta_1)
+
+t_max_B<-max(summarise(group_by(t_viaje_B, g_hour), t_tot= sum(t_vuelta)))
+hora_max_B<-filter(summarise(group_by(t_viaje_B, g_hour), t_tot= sum(t_vuelta)), t_tot==t_max_B) %>% 
+  select(g_hour)
+
+
+
+```
+
+```{r}
+ggplot(t_viaje_B)+
+  geom_bar(aes(x=g_hour, weight = t_vuelta, fill= Sentido), width=.75, color="Black") + 
+        labs(title = paste0("Linea",linea) ,
+        subtitle = ("Tiempo de Vuelta Ramal B"),
+        caption = "Fuente: Datos SUBE",
+        x="Hora inicio",y="Tiempo de vuelta (minutos)")
+
+
+
+```
+
+### Ramal C
+Burzaco - Pompeya
+```{r, RAMAL C}
+
+ramal<-"Ramal C"
+
+Pompeya_1<-primeros(Pompeya)
+Pompeya_2<-ultimos(Pompeya)
+
+
+Burzaco_1<-primeros(Burzaco)
+Burzaco_2<-ultimos(Burzaco)
+
+
+Ramal_C_Ida_1<-proceso_tvuelta(Pompeya_2, Burzaco_1, 200, ramal, "Ida" )
+Ramal_C_Vuelta_1<-proceso_tvuelta(Burzaco_2, Pompeya_1, 200, ramal, "Vuelta" )
+
+t_viaje_C<-proceso_tviaje(Ramal_C_Ida_1,Ramal_C_Vuelta_1)
+
+t_max_C<-max(summarise(group_by(t_viaje_C, g_hour), t_tot= sum(t_vuelta)))
+hora_max_C<-filter(summarise(group_by(t_viaje_C, g_hour), t_tot= sum(t_vuelta)), t_tot==t_max_C) %>% 
+  select(g_hour)
+
+
+
+```
+
+```{r}
+ggplot(t_viaje_C)+
+  geom_bar(aes(x=g_hour, weight = t_vuelta, fill= Sentido), width=.75, color="Black") + 
+        labs(title = paste0("Linea",linea) ,
+        subtitle = paste0("Tiempo de Vuelta ",ramal),
+        caption = "Fuente: Datos SUBE",
+        x="Hora inicio",y="Tiempo de vuelta (minutos)")
+
+
+```
+
+
+### Ramal E
+```{r, RAMAL E}
+
+ramal<-"Ramal E"
+id_ramal<-646
+Monte_Grande_1<-primeros(filter(Monte_Grande, s_branch==id_ramal))
+Monte_Grande_2<-ultimos(filter(Monte_Grande, s_branch==id_ramal))
+Pompeya_E_1<-filter(Pompeya, s_branch==id_ramal) %>% 
+  primeros()
+Pompeya_E_2<-filter(Pompeya, s_branch==id_ramal) %>% 
+  ultimos()
+
+
+Ramal_E_Ida_1<-proceso_tvuelta_2(Pompeya_E_2, Monte_Grande_1, 200, ramal, "Ida" ) 
+Ramal_E_Vuelta_1<-proceso_tvuelta_2(Monte_Grande_2, Pompeya_E_1, 200, ramal, "Vuelta" )
+t_viaje_E<-proceso_tviaje(Ramal_E_Ida_1,Ramal_E_Vuelta_1)
+
+t_max_E<-max(summarise(group_by(t_viaje_E, g_hour), t_tot= sum(t_vuelta)))
+hora_max_E<-filter(summarise(group_by(t_viaje_E, g_hour), t_tot= sum(t_vuelta)), t_tot==t_max_E) %>% 
+  select(g_hour)
+
+
+
+```
+
+```{r}
+ggplot(t_viaje_E)+
+  geom_bar(aes(x=g_hour, weight = t_vuelta, fill= Sentido), width=.75, color="Black") + 
+        labs(title = paste0("Linea",linea) ,
+        subtitle = paste0("Tiempo de Vuelta ",ramal),
+        caption = "Fuente: Datos SUBE",
+        x="Hora inicio",y="Tiempo de vuelta (minutos)")
+
+
+
+```
+
+
+
+### Ramal F
+```{r, RAMAL F}
+
+ramal<-"Ramal F"
+id_ramal<-1534
+
+Lomas_F_1<-filter(Lomas, s_branch==id_ramal) %>% 
+  primeros()
+Lomas_F_2<-filter(Lomas, s_branch==id_ramal) %>% 
+  ultimos()
+
+Once_F_1<-filter(Once, s_branch==id_ramal) %>% 
+  primeros()
+Once_F_2<-filter(Once, s_branch==id_ramal) %>% 
+  ultimos()
+
+
+
+Ramal_F_Ida_1<-proceso_tvuelta(Once_F_2,Lomas_F_1, 175, "Ramal F", "Ida" )
+Ramal_F_Vuelta_1<-proceso_tvuelta(Lomas_F_2, Once_F_1, 175, "Ramal F", "Vuelta" )
+
+t_viaje_F<-proceso_tviaje(Ramal_F_Ida_1,Ramal_F_Vuelta_1)
+
+t_max_F<-max(summarise(group_by(t_viaje_F, g_hour), t_tot= sum(t_vuelta)))
+hora_max_F<-filter(summarise(group_by(t_viaje_F, g_hour), t_tot= sum(t_vuelta)), t_tot==t_max_F) %>% 
+  select(g_hour)
+
+
+
+```
+
+```{r}
+ggplot(t_viaje_F)+
+  geom_bar(aes(x=g_hour, weight = t_vuelta, fill= Sentido), width=.75, color="Black") + 
+        labs(title = paste0("Linea",linea) ,
+        subtitle = paste0("Tiempo de Vuelta ",ramal),
+        caption = "Fuente: Datos SUBE",
+        x="Hora inicio",y="Tiempo de vuelta (minutos)")
+
+
+
+```
+
+
+
+
+## PARQUE y FRECUENCIA
+
+```{r}
+t_viaje<-rbind(t_viaje_A,t_viaje_C,t_viaje_E,t_viaje_F)
+
+t_viaje_tot<-summarise(group_by(t_viaje,g_hour,Ramal), t_tot=sum(t_vuelta)) %>% ungroup()
+
+t_viaje_max<-filter(group_by(t_viaje_tot, Ramal),t_tot==max(t_tot))
+
+
+
+```
+
+```{r}
+t_espera<- function(t_ida){
+  if (t_ida>120) {
+    te_1<- 15 + (trunc((t_ida-120.1)/30)+1) *5
+    te_2<- 5
+  }
+
+  if (t_ida > 60 & t_ida<120){
+    te_1<- 15 
+    te_2<- 5
+  }
+  
+  if (t_ida <= 60) {
+    te_1<-15
+    te_2<-0
+  }
+  te_1+te_2
+}
+
+
+```
+```{r}
+t_vuelta_tot<-mutate(t_viaje_max, t_e= t_espera(t_tot/2)) %>% 
+  mutate(t_total=round(t_tot+t_e),0)
+
+write_csv(t_vuelta_tot, "t_vuelta.csv")
+```
+##Mapas
+ Vamos a modificar el shape para tener la cantidad de servicios
+
+```{r}
+
+
+# Get the GPS coordinates of a set of 200k tweets:
+data=read.table("https://www.r-graph-gallery.com/wp-content/uploads/2017/12/Coordinate_Surf_Tweets.csv", sep=",", header=T)
+
+# Get the world polygon
+library(mapdata)
+world <- map_data("world")
+
+# Make the hexbin map with the geom_hex function
+ggplot(data, aes(x=homelon, y=homelat)) + 
+  geom_polygon(data = world, aes(x=long, y = lat, group = group), fill="grey", alpha=0.3) +
+  geom_hex(bins=80) +
+  theme_void() +
+  scale_fill_viridis(
+    trans = "log", 
+    name="Number of Tweets", 
+    guide = guide_legend( keyheight = unit(3, units = "mm"), keywidth=unit(12, units = "mm"), label.position = "bottom", title.position = 'top', nrow=1)) +
+  theme(legend.position = c(0.5, 0.09)) +
+  ylim(-70, 80)
+```
+```{r}
+ggplot() +
+  geom_hex(data=TRX, aes(x=lon, y =lat), bins = 20, ) +
+  geom_sf(data = lineas, aes(color=RECORRIDO)) +
+  scale_fill_viridis_c(option = "D",  na.value = "transparent", begin = 0, end= 1, limits = c(10,2000)) +
+    labs(title = "Validaciones",
+         subtitle = linea,
+         fill = "cantidad")+
+  theme_light()+
+  coord_sf()
+
+```
+```{r}
+tm_shape(lineas) +
+  tm_lines(col = "RECORRIDO") +
+  tm_compass() +
+  geom_bin2d(data = TRX, aes(x = lon, y = lat), bins = 100)
+```
+```{r}
+ggplot() +
+ 
+    geom_hex(data = filter(TRX, s_branch==643), aes(x = lon, y = lat), bins = 30, 
+             limits = c(50,500)) +
+  facet_wrap(~s_direct)+
+  
+    scale_fill_viridis_c()
+```
+
+```{r}
+mi_token <- 'pk.eyJ1IjoidGRhZWxzIiwiYSI6ImNqb3VvaXo2NjBoeHIzcHJxZGNuYnpsdXcifQ.IylmZ_OEwohveePw7khqxg'    ## ponga su propio token aquí
+set_token(token = mi_token)
+
+ms = mapdeck_style("dark")
+
+mapdeck(style = ms, pitch = 45, location = c(-34.8, -58.5), zoom = 4) %>%
+add_grid(data = TRX, lat = "lat", lon = "lon", cell_size = 100,
+         elevation_scale = 1, layer_id = "grid_layer",
+         colour_range = viridisLite::plasma(5)) %>% 
+ add_path(
+    data = lineas,
+    layer_id = "recorridos")
+```
